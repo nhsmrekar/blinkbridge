@@ -16,9 +16,31 @@ class StreamServer:
         self.stream_name = stream_name
         self.stream_name_sanitized = stream_name.replace(' ', '_').lower()
         self.current_still_video = None
+        # No clip available yet (e.g. Blink API was unreachable on the
+        # last poll) -- start_server() leaves this None rather than
+        # spawning ffmpeg against a nonexistent still video. is_running()
+        # must treat that the same as "not running" so main.py's existing
+        # backoff/retry loop picks it back up on its own, instead of
+        # crashing the still-video background thread (found 2026-08-08:
+        # a None clip reached ffmpeg's argv directly, raising
+        # `TypeError: expected str, bytes or os.PathLike, not NoneType`
+        # deep in a bare threading.Thread with no handler -- the thread
+        # died silently, but add_video() carried on and wrote a concat
+        # file pointing at a still video that was never created).
+        self.process = None
+        # On-demand real live view (see Application.start_liveview) --
+        # while active, this process temporarily takes over the same
+        # mediamtx output path from the normal concat-loop publisher
+        # below, and the main motion-poll loop must not touch this
+        # StreamServer's `process`/concat files until it stops.
+        self.live_process = None
+        self.is_live = False
+
+    def _output_url(self) -> str:
+        return f"{RTSP_URL}/{self.stream_name_sanitized}"
 
     def _run_server(self) -> str:
-        output_url = f"{RTSP_URL}/{self.stream_name_sanitized}"
+        output_url = self._output_url()
         input_concat_file = PATH_CONCAT / f"{self.stream_name_sanitized}.concat"
 
         ffmpeg_args = [
@@ -39,7 +61,7 @@ class StreamServer:
             '-fps_mode', 'drop',
             output_url
         ]
-        
+
         self.process = subprocess.Popen(ffmpeg_args, stdout=sys.stdout, stderr=sys.stderr)
 
         return output_url
@@ -67,14 +89,14 @@ class StreamServer:
 
         with open(next_concat, 'w') as f:
             f.write("ffconcat version 1.0\n")
-            f.write(f"file '{video_file_name.resolve()}'\n") 
+            f.write(f"file '{video_file_name.resolve()}'\n")
 
         return next_concat
 
     def add_video(self, file_name_input_video: Union[str, Path], still_only: bool=False) -> None:
         if not still_only:
             # enqueue fullclip immediately
-            self._enqueue_clip(file_name_input_video) 
+            self._enqueue_clip(file_name_input_video)
 
         # make a timestamped name for the next still video
         dt = datetime.now()
@@ -85,12 +107,12 @@ class StreamServer:
         svc = StillVideoCreator(file_name_input_video,
                                 output_duration=CONFIG['still_video_duration'],
                                 file_name_still_video=next_still_video)
-        
+
         # wait for enqueued video to start
         if not still_only:
             log.debug(f"{self.stream_name}: waiting for new video to start")
             wait_until_file_open(file_name_input_video, self.process.pid)
-            
+
         # enqueue next still video
         log.debug(f'{self.stream_name}: waiting for still video creation to finish')
         svc.wait()
@@ -100,23 +122,82 @@ class StreamServer:
         if self.current_still_video and not still_only:
             log.debug(f'{self.stream_name}: deleting old still video {self.current_still_video}')
             self.current_still_video.unlink()
-        
+
         self.current_still_video = next_still_video
-    
+
     def is_running(self) -> bool:
-        return self.process.poll() is None
-    
+        return self.process is not None and self.process.poll() is None
+
     def close(self) -> None:
         if self.is_running():
             log.info(f"{self.stream_name}: stopping server")
             self.process.kill()
+        if self.live_process and self.live_process.poll() is None:
+            self.live_process.kill()
 
-    def start_server(self, file_name_initial_video: Union[str, Path]) -> None:
+    def start_server(self, file_name_initial_video: Union[str, Path, None]) -> None:
         log.debug(f"{self.stream_name}: starting server with {file_name_initial_video}")
         self._make_concat_files()
+        if file_name_initial_video is None:
+            # Blink's cloud API was unreachable / had no clips for this
+            # camera on this poll -- deliberately do NOT call add_video()
+            # here: it would pass None all the way into ffmpeg's argv and
+            # crash the still-video background thread (see __init__'s
+            # comment for the 2026-08-08 incident this guards against).
+            # Leaving self.process as None makes is_running() report
+            # False, so main.py's existing failure-backoff loop retries
+            # this camera on its own -- same self-healing path as any
+            # other stream failure, just without the crash and the
+            # broken concat file it left behind along the way.
+            log.warning(f"{self.stream_name}: no clip available yet, deferring stream start")
+            return
         self.add_video(file_name_initial_video, still_only=True)
         url = self._run_server()
 
         log.info(f"{self.stream_name}: stream ready at {url}")
 
-    
+    def start_live_relay(self, tcp_source_url: str) -> None:
+        """
+        Switch this camera's mediamtx output from the normal motion-clip
+        loop to a real, on-demand Blink liveview session. `tcp_source_url`
+        is the loopback MPEG-TS server a blinkpy BlinkLiveStream is
+        already feeding (see Application.start_liveview) -- ffmpeg just
+        relays it through to the same output path Frigate already reads
+        from, so nothing downstream (mediamtx config, Frigate, cabin-
+        backend) needs to know the difference.
+        """
+        if self.is_live:
+            log.debug(f"{self.stream_name}: live relay already running")
+            return
+
+        log.info(f"{self.stream_name}: switching to real live view")
+        # Pause the concat-loop publisher -- it owns the same output URL
+        # and would otherwise fight the live relay for the RTSP publish.
+        if self.is_running():
+            self.process.kill()
+
+        output_url = self._output_url()
+        ffmpeg_args = [
+            'ffmpeg',
+            *COMMON_FFMPEG_ARGS,
+            '-fflags', '+igndts+genpts',
+            '-f', 'mpegts',
+            '-i', tcp_source_url,
+            '-c:v', 'copy',
+            '-an',  # Blink's liveview payload here is video-only (see BlinkLiveStream.recv's msgtype filter) -- no audio track to carry.
+            '-f', 'rtsp',
+            output_url,
+        ]
+        self.live_process = subprocess.Popen(ffmpeg_args, stdout=sys.stdout, stderr=sys.stderr)
+        self.is_live = True
+
+    def stop_live_relay(self) -> None:
+        """Stop the live relay and resume the normal motion-clip loop on the same output path."""
+        if self.live_process and self.live_process.poll() is None:
+            log.info(f"{self.stream_name}: stopping live relay")
+            self.live_process.kill()
+        self.live_process = None
+        self.is_live = False
+        # Resume the concat-loop publisher against the same still/clip
+        # files that were already in place before live view started.
+        self._run_server()
