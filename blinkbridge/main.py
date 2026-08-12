@@ -23,6 +23,8 @@ log = logging.getLogger(__name__)
 # (e.g. a browser tab closed without calling /stop) shouldn't run forever,
 # so it's force-stopped after this long regardless.
 LIVEVIEW_MAX_DURATION = timedelta(minutes=5)
+LIVEVIEW_RETRY_BASE = timedelta(seconds=5)
+LIVEVIEW_RETRY_MAX = timedelta(minutes=1)
 
 # 2026-08-06: cap for the failure-backoff below -- never let a
 # repeatedly-failing camera wait longer than this between retries.
@@ -35,6 +37,10 @@ class Application:
         self.running = False
         # camera_name -> {"live_stream": BlinkLiveStream, "started_at": datetime}
         self.live_sessions = {}
+        # A liveview request outlives an individual Blink cloud session.
+        # Dropped sessions are retried only while a viewer still wants live
+        # footage, and never beyond LIVEVIEW_MAX_DURATION.
+        self.liveview_requests = {}
 
     async def start_stream(self, camera_name: str, redownload: bool=False) -> StreamServer:
         if redownload:
@@ -82,6 +88,27 @@ class Application:
             log.debug(f"{camera_name}: liveview already active")
             return True
 
+        request = self.liveview_requests.setdefault(camera_name, {
+            "requested_at": datetime.now(),
+            "retry_count": 0,
+            "next_retry_at": None,
+            "last_error": None,
+        })
+
+        try:
+            await self._open_liveview_session(camera_name)
+            request["retry_count"] = 0
+            request["next_retry_at"] = None
+            request["last_error"] = None
+            return True
+        except Exception as exc:
+            self._schedule_liveview_retry(camera_name, exc)
+            log.warning(f"{camera_name}: liveview start failed; retry scheduled: {exc}")
+            return False
+
+    async def _open_liveview_session(self, camera_name: str) -> None:
+        """Open one Blink cloud session for an existing viewer request."""
+
         camera = self.cam_manager.blink.cameras[camera_name]
         log.info(f"{camera_name}: starting real liveview session")
         live_stream = await camera.init_livestream()
@@ -105,14 +132,26 @@ class Application:
         await asyncio.sleep(1.5)
 
         self.stream_servers[camera_name].start_live_relay(f"tcp://127.0.0.1:{port}")
-        return True
 
-    async def stop_liveview(self, camera_name: str) -> bool:
+    def _schedule_liveview_retry(self, camera_name: str, exc: Exception | None = None) -> None:
+        request = self.liveview_requests[camera_name]
+        request["retry_count"] += 1
+        delay = min(
+            LIVEVIEW_RETRY_BASE * (2 ** (request["retry_count"] - 1)),
+            LIVEVIEW_RETRY_MAX,
+        )
+        request["next_retry_at"] = datetime.now() + delay
+        request["last_error"] = str(exc) if exc else "Blink ended the live session"
+
+    async def stop_liveview(self, camera_name: str, *, keep_request: bool = False) -> bool:
         """Stop an active liveview session and resume the normal motion-clip loop."""
+        had_request = camera_name in self.liveview_requests
+        if not keep_request:
+            self.liveview_requests.pop(camera_name, None)
         session = self.live_sessions.pop(camera_name, None)
         if session is None:
             log.debug(f"{camera_name}: no active liveview session to stop")
-            return False
+            return had_request
 
         log.info(f"{camera_name}: stopping liveview session")
         session["live_stream"].stop()
@@ -126,12 +165,45 @@ class Application:
     async def _enforce_liveview_max_duration(self) -> None:
         now = datetime.now()
         expired = [
-            name for name, session in self.live_sessions.items()
-            if now > session["started_at"] + LIVEVIEW_MAX_DURATION
+            name for name, request in self.liveview_requests.items()
+            if now > request["requested_at"] + LIVEVIEW_MAX_DURATION
         ]
         for camera_name in expired:
             log.warning(f"{camera_name}: liveview session exceeded max duration, force-stopping")
             await self.stop_liveview(camera_name)
+
+    async def _retry_dropped_liveview_sessions(self) -> None:
+        now = datetime.now()
+        for camera_name, request in list(self.liveview_requests.items()):
+            if camera_name in self.live_sessions:
+                continue
+            retry_at = request["next_retry_at"]
+            if retry_at is None or now < retry_at:
+                continue
+            try:
+                log.info(f"{camera_name}: retrying real liveview session")
+                await self._open_liveview_session(camera_name)
+                request["next_retry_at"] = None
+                request["last_error"] = None
+            except Exception as exc:
+                self._schedule_liveview_retry(camera_name, exc)
+                log.warning(f"{camera_name}: liveview retry failed; backing off: {exc}")
+
+    def liveview_status(self, camera_name: str) -> dict:
+        if camera_name not in self.stream_servers:
+            return {"camera": camera_name, "mode": "unavailable", "live": False}
+        request = self.liveview_requests.get(camera_name)
+        if camera_name in self.live_sessions:
+            return {"camera": camera_name, "mode": "live", "live": True}
+        if request:
+            return {
+                "camera": camera_name,
+                "mode": "reconnecting",
+                "live": False,
+                "last_error": request["last_error"],
+                "next_retry_at": request["next_retry_at"].isoformat() if request["next_retry_at"] else None,
+            }
+        return {"camera": camera_name, "mode": "clip_loop", "live": False}
 
     async def _reap_dead_liveview_sessions(self) -> None:
         """
@@ -155,7 +227,8 @@ class Application:
                 log.error(f"{camera_name}: liveview session ended unexpectedly: {exc}")
             else:
                 log.warning(f"{camera_name}: liveview session ended on Blink's end, falling back to motion-clip loop")
-            await self.stop_liveview(camera_name)
+            await self.stop_liveview(camera_name, keep_request=True)
+            self._schedule_liveview_retry(camera_name, exc)
 
     async def start(self) -> None:
         self.running = True
@@ -180,6 +253,7 @@ class Application:
         while self.running:
             await self._reap_dead_liveview_sessions()
             await self._enforce_liveview_max_duration()
+            await self._retry_dropped_liveview_sessions()
 
             # check for motion on each stream server -- skip any camera
             # currently in a real liveview session; its StreamServer's
@@ -268,9 +342,15 @@ def make_web_app(app: Application) -> web.Application:
         ok = await app.stop_liveview(camera_name)
         return web.json_response({"ok": ok}, status=200 if ok else 404)
 
+    async def handle_status(request: web.Request) -> web.Response:
+        camera_name = request.match_info["camera"]
+        status = app.liveview_status(camera_name)
+        return web.json_response(status, status=404 if status["mode"] == "unavailable" else 200)
+
     web_app = web.Application()
     web_app.router.add_post("/liveview/{camera}/start", handle_start)
     web_app.router.add_post("/liveview/{camera}/stop", handle_stop)
+    web_app.router.add_get("/liveview/{camera}/status", handle_status)
     return web_app
 
 async def main() -> None:

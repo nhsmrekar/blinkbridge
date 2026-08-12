@@ -1,6 +1,7 @@
 import sys
 import types
 import unittest
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 
@@ -22,10 +23,11 @@ fake_utils.wait_until_file_open = MagicMock()
 fake_ffmpeg = types.ModuleType("blinkbridge.ffmpeg")
 fake_ffmpeg.StillVideoCreator = MagicMock()
 
-sys.path.insert(0, "/app")
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PROJECT_ROOT))
 
 blinkbridge_pkg = types.ModuleType("blinkbridge")
-blinkbridge_pkg.__path__ = ["/app/blinkbridge"]  # real package dir -- lets `blinkbridge.stream_server` still resolve from disk
+blinkbridge_pkg.__path__ = [str(PROJECT_ROOT / "blinkbridge")]
 sys.modules["blinkbridge"] = blinkbridge_pkg
 sys.modules["blinkbridge.config"] = fake_config
 sys.modules["blinkbridge.utils"] = fake_utils
