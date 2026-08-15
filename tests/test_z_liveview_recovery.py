@@ -121,6 +121,21 @@ class MotionTriggeredLiveviewTest(unittest.IsolatedAsyncioTestCase):
 
         start.assert_not_awaited()
 
+    def test_idle_motion_only_camera_reports_awaiting_motion_not_clip_loop(self):
+        self.app.stream_servers["AldrichFront"].current_still_video = None
+
+        status = self.app.liveview_status("AldrichFront")
+
+        self.assertEqual("idle_awaiting_motion", status["mode"])
+        self.assertFalse(status["live"])
+
+    def test_motion_only_camera_with_a_clip_still_reports_clip_loop(self):
+        self.app.stream_servers["AldrichFront"].current_still_video = "some_clip.mp4"
+
+        status = self.app.liveview_status("AldrichFront")
+
+        self.assertEqual("clip_loop", status["mode"])
+
 
 if __name__ == "__main__":
     unittest.main()

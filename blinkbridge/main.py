@@ -212,6 +212,19 @@ class Application:
                 "last_error": request["last_error"],
                 "next_retry_at": request["next_retry_at"].isoformat() if request["next_retry_at"] else None,
             }
+        # A motion-liveview-only camera (e.g. AldrichFront) has no cloud
+        # clip to loop between motion events -- stop_live_relay() leaves
+        # current_still_video None for exactly this case (see that
+        # method's own comment). Reporting "clip_loop" here would be a
+        # real lie: it implies footage is actively looping/available when
+        # the stream is genuinely idle with nothing to show. Only applies
+        # to cameras opted into motion_liveview_enabled; a normal
+        # clip-loop camera (e.g. driveway) is unaffected.
+        if (
+            camera_name in self.motion_liveview_cameras
+            and self.stream_servers[camera_name].current_still_video is None
+        ):
+            return {"camera": camera_name, "mode": "idle_awaiting_motion", "live": False}
         return {"camera": camera_name, "mode": "clip_loop", "live": False}
 
     async def _reap_dead_liveview_sessions(self) -> None:
