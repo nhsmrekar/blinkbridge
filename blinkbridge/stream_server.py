@@ -199,5 +199,10 @@ class StreamServer:
         self.live_process = None
         self.is_live = False
         # Resume the concat-loop publisher against the same still/clip
-        # files that were already in place before live view started.
-        self._run_server()
+        # files that were already in place before live view started. A
+        # motion-liveview-only camera may never have had a cloud clip.
+        if self.current_still_video is not None:
+            self._run_server()
+        else:
+            self.process = None
+            log.info(f"{self.stream_name}: liveview stopped; awaiting next motion trigger")

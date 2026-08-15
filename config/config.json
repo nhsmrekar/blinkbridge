@@ -8,6 +8,7 @@
     "cameras": {
       "enabled": [],
       "disabled": [],
+      "motion_liveview_enabled": [],
       "max_failures": 3,
       "restart_delay_seconds": 60
     },

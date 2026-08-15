@@ -85,6 +85,42 @@ class LiveviewRecoveryTest(unittest.IsolatedAsyncioTestCase):
         await self.app._enforce_liveview_max_duration()
         self.assertNotIn("driveway", self.app.liveview_requests)
 
+    async def test_repeated_motion_extends_active_liveview_request(self):
+        self.app.live_sessions["driveway"] = {"feed_task": MagicMock()}
+        original = datetime.now() - timedelta(minutes=4)
+        self.app.liveview_requests["driveway"]["requested_at"] = original
+
+        self.assertTrue(await self.app.start_liveview("driveway"))
+
+        self.assertGreater(
+            self.app.liveview_requests["driveway"]["requested_at"], original
+        )
+
+
+class MotionTriggeredLiveviewTest(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.app = Application()
+        self.app.motion_liveview_cameras = {"AldrichFront"}
+        self.app.stream_servers["AldrichFront"] = MagicMock()
+        self.app.cam_manager = MagicMock()
+
+    async def test_motion_without_cloud_clip_starts_liveview(self):
+        self.app.cam_manager.check_for_motion = AsyncMock(return_value=(True, None))
+
+        with patch.object(self.app, "start_liveview", AsyncMock(return_value=True)) as start:
+            self.assertTrue(await self.app.check_for_motion("AldrichFront"))
+
+        start.assert_awaited_once_with("AldrichFront")
+        self.app.stream_servers["AldrichFront"].add_video.assert_not_called()
+
+    async def test_no_new_motion_does_not_start_liveview(self):
+        self.app.cam_manager.check_for_motion = AsyncMock(return_value=(False, None))
+
+        with patch.object(self.app, "start_liveview", AsyncMock()) as start:
+            self.assertFalse(await self.app.check_for_motion("AldrichFront"))
+
+        start.assert_not_awaited()
+
 
 if __name__ == "__main__":
     unittest.main()

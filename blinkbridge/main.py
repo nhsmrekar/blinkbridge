@@ -41,6 +41,9 @@ class Application:
         # Dropped sessions are retried only while a viewer still wants live
         # footage, and never beyond LIVEVIEW_MAX_DURATION.
         self.liveview_requests = {}
+        self.motion_liveview_cameras = set(
+            CONFIG.get("cameras", {}).get("motion_liveview_enabled", [])
+        )
 
     async def start_stream(self, camera_name: str, redownload: bool=False) -> StreamServer:
         if redownload:
@@ -58,17 +61,21 @@ class Application:
 
     async def check_for_motion(self, camera_name: str) -> bool:
         ss = self.stream_servers[camera_name]
+        motion_detected, file_name_new_clip = await self.cam_manager.check_for_motion(camera_name)
 
-        if not ss.is_running():
+        if not motion_detected:
             return False
 
-        file_name_new_clip = await self.cam_manager.check_for_motion(camera_name)
+        if camera_name in self.motion_liveview_cameras:
+            log.info(f"{camera_name}: motion-triggered liveview requested")
+            await self.start_liveview(camera_name)
 
-        if not file_name_new_clip:
-            return False
-
-        log.info(f"{ss.stream_name}: motion detected, adding video")
-        ss.add_video(file_name_new_clip)
+        if file_name_new_clip:
+            log.info(f"{ss.stream_name}: motion clip available, adding video")
+            if ss.is_running():
+                ss.add_video(file_name_new_clip)
+            elif camera_name not in self.live_sessions:
+                ss.start_server(file_name_new_clip)
 
         return True
 
@@ -86,6 +93,7 @@ class Application:
 
         if camera_name in self.live_sessions:
             log.debug(f"{camera_name}: liveview already active")
+            self.liveview_requests[camera_name]["requested_at"] = datetime.now()
             return True
 
         request = self.liveview_requests.setdefault(camera_name, {

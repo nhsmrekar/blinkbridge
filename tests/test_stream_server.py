@@ -70,6 +70,19 @@ class StartServerNoClipTest(unittest.TestCase):
         mock_add_video.assert_called_once_with("/working/some_real_clip.mp4", still_only=True)
         mock_run.assert_called_once()
 
+    def test_liveview_only_camera_does_not_resume_missing_clip_loop(self):
+        server = StreamServer("AldrichFront")
+        server.is_live = True
+        server.live_process = MagicMock()
+        server.live_process.poll.return_value = None
+
+        with patch.object(server, "_run_server") as mock_run:
+            server.stop_live_relay()
+
+        self.assertIsNone(server.live_process)
+        self.assertFalse(server.is_live)
+        mock_run.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()
