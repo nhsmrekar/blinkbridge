@@ -25,6 +25,7 @@ log = logging.getLogger(__name__)
 LIVEVIEW_MAX_DURATION = timedelta(minutes=5)
 LIVEVIEW_RETRY_BASE = timedelta(seconds=5)
 LIVEVIEW_RETRY_MAX = timedelta(minutes=1)
+MIN_BLINK_POLL_INTERVAL_SECONDS = 30
 
 # 2026-08-06: cap for the failure-backoff below -- never let a
 # repeatedly-failing camera wait longer than this between retries.
@@ -318,7 +319,14 @@ class Application:
                     ss_new.failure_count = ss.failure_count + 1
                     ss_new.datetime_started = datetime.now()
 
-            await asyncio.sleep(CONFIG['blink']['poll_interval'])
+            configured_poll_interval = CONFIG['blink']['poll_interval']
+            poll_interval = max(configured_poll_interval, MIN_BLINK_POLL_INTERVAL_SECONDS)
+            if configured_poll_interval < MIN_BLINK_POLL_INTERVAL_SECONDS:
+                log.warning(
+                    f"Blink poll_interval {configured_poll_interval}s is below the safe floor; "
+                    f"using {MIN_BLINK_POLL_INTERVAL_SECONDS}s"
+                )
+            await asyncio.sleep(poll_interval)
 
     async def close(self) -> None:
         self.running = False
