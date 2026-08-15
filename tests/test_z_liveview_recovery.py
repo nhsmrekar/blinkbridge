@@ -33,7 +33,7 @@ sys.modules["rich"] = fake_rich
 sys.modules["rich.logging"] = fake_rich_logging
 sys.modules["rich.highlighter"] = fake_rich_highlighter
 
-from blinkbridge.main import Application, LIVEVIEW_MAX_DURATION  # noqa: E402
+from blinkbridge.main import Application, LIVEVIEW_MAX_DURATION, MOTION_LIVEVIEW_MAX_DURATION  # noqa: E402
 
 
 class LiveviewRecoveryTest(unittest.IsolatedAsyncioTestCase):
@@ -110,8 +110,21 @@ class MotionTriggeredLiveviewTest(unittest.IsolatedAsyncioTestCase):
         with patch.object(self.app, "start_liveview", AsyncMock(return_value=True)) as start:
             self.assertTrue(await self.app.check_for_motion("AldrichFront"))
 
-        start.assert_awaited_once_with("AldrichFront")
+        start.assert_awaited_once_with("AldrichFront", motion_triggered=True)
         self.app.stream_servers["AldrichFront"].add_video.assert_not_called()
+
+    async def test_motion_request_uses_short_battery_aware_cap(self):
+        self.app.live_sessions["AldrichFront"] = {"feed_task": MagicMock()}
+        self.app.liveview_requests["AldrichFront"] = {
+            "requested_at": datetime.now(),
+            "max_duration": LIVEVIEW_MAX_DURATION,
+        }
+
+        self.assertTrue(await self.app.start_liveview("AldrichFront", motion_triggered=True))
+        self.assertEqual(
+            MOTION_LIVEVIEW_MAX_DURATION,
+            self.app.liveview_requests["AldrichFront"]["max_duration"],
+        )
 
     async def test_no_new_motion_does_not_start_liveview(self):
         self.app.cam_manager.check_for_motion = AsyncMock(return_value=(False, None))

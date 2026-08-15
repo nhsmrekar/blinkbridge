@@ -23,6 +23,7 @@ log = logging.getLogger(__name__)
 # (e.g. a browser tab closed without calling /stop) shouldn't run forever,
 # so it's force-stopped after this long regardless.
 LIVEVIEW_MAX_DURATION = timedelta(minutes=5)
+MOTION_LIVEVIEW_MAX_DURATION = timedelta(seconds=90)
 LIVEVIEW_RETRY_BASE = timedelta(seconds=5)
 LIVEVIEW_RETRY_MAX = timedelta(minutes=1)
 MIN_BLINK_POLL_INTERVAL_SECONDS = 30
@@ -69,7 +70,7 @@ class Application:
 
         if camera_name in self.motion_liveview_cameras:
             log.info(f"{camera_name}: motion-triggered liveview requested")
-            await self.start_liveview(camera_name)
+            await self.start_liveview(camera_name, motion_triggered=True)
 
         if file_name_new_clip:
             log.info(f"{ss.stream_name}: motion clip available, adding video")
@@ -80,7 +81,7 @@ class Application:
 
         return True
 
-    async def start_liveview(self, camera_name: str) -> bool:
+    async def start_liveview(self, camera_name: str, *, motion_triggered: bool = False) -> bool:
         """
         Start a real, on-demand Blink liveview session for camera_name and
         relay it through to the same mediamtx output path the motion-clip
@@ -92,9 +93,12 @@ class Application:
             log.warning(f"{camera_name}: liveview requested for unknown/disabled camera")
             return False
 
+        max_duration = MOTION_LIVEVIEW_MAX_DURATION if motion_triggered else LIVEVIEW_MAX_DURATION
         if camera_name in self.live_sessions:
             log.debug(f"{camera_name}: liveview already active")
             self.liveview_requests[camera_name]["requested_at"] = datetime.now()
+            if motion_triggered:
+                self.liveview_requests[camera_name]["max_duration"] = max_duration
             return True
 
         request = self.liveview_requests.setdefault(camera_name, {
@@ -102,6 +106,7 @@ class Application:
             "retry_count": 0,
             "next_retry_at": None,
             "last_error": None,
+            "max_duration": max_duration,
         })
 
         try:
@@ -175,7 +180,7 @@ class Application:
         now = datetime.now()
         expired = [
             name for name, request in self.liveview_requests.items()
-            if now > request["requested_at"] + LIVEVIEW_MAX_DURATION
+            if now > request["requested_at"] + request.get("max_duration", LIVEVIEW_MAX_DURATION)
         ]
         for camera_name in expired:
             log.warning(f"{camera_name}: liveview session exceeded max duration, force-stopping")
