@@ -28,6 +28,8 @@ Once the RTSP streams are available, you can use them in applications such as [F
 3. Run `docker compose run blinkbridge` and enter your Blink verification code when prompted (this only has to be done once and will be saved in `config/.cred.json`). Exit with CTRL+c
 4. Run `docker compose up` to start the service. The RTSP URLs will be printed to the console.
 
+To start Blink Live View when motion is reported even when no cloud clip is available, include the camera in both `cameras.enabled` and `cameras.motion_liveview_enabled`. This is intended for event-triggered recording systems such as Frigate; polling delay means it cannot capture footage before the alert.
+
 # TODO
 
 - [ ] Better error handling

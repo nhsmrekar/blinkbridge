@@ -23,8 +23,10 @@ log = logging.getLogger(__name__)
 # (e.g. a browser tab closed without calling /stop) shouldn't run forever,
 # so it's force-stopped after this long regardless.
 LIVEVIEW_MAX_DURATION = timedelta(minutes=5)
+MOTION_LIVEVIEW_MAX_DURATION = timedelta(seconds=90)
 LIVEVIEW_RETRY_BASE = timedelta(seconds=5)
 LIVEVIEW_RETRY_MAX = timedelta(minutes=1)
+MIN_BLINK_POLL_INTERVAL_SECONDS = 30
 
 # 2026-08-06: cap for the failure-backoff below -- never let a
 # repeatedly-failing camera wait longer than this between retries.
@@ -41,6 +43,9 @@ class Application:
         # Dropped sessions are retried only while a viewer still wants live
         # footage, and never beyond LIVEVIEW_MAX_DURATION.
         self.liveview_requests = {}
+        self.motion_liveview_cameras = set(
+            CONFIG.get("cameras", {}).get("motion_liveview_enabled", [])
+        )
 
     async def start_stream(self, camera_name: str, redownload: bool=False) -> StreamServer:
         if redownload:
@@ -58,21 +63,25 @@ class Application:
 
     async def check_for_motion(self, camera_name: str) -> bool:
         ss = self.stream_servers[camera_name]
+        motion_detected, file_name_new_clip = await self.cam_manager.check_for_motion(camera_name)
 
-        if not ss.is_running():
+        if not motion_detected:
             return False
 
-        file_name_new_clip = await self.cam_manager.check_for_motion(camera_name)
+        if camera_name in self.motion_liveview_cameras:
+            log.info(f"{camera_name}: motion-triggered liveview requested")
+            await self.start_liveview(camera_name, motion_triggered=True)
 
-        if not file_name_new_clip:
-            return False
-
-        log.info(f"{ss.stream_name}: motion detected, adding video")
-        ss.add_video(file_name_new_clip)
+        if file_name_new_clip:
+            log.info(f"{ss.stream_name}: motion clip available, adding video")
+            if ss.is_running():
+                ss.add_video(file_name_new_clip)
+            elif camera_name not in self.live_sessions:
+                ss.start_server(file_name_new_clip)
 
         return True
 
-    async def start_liveview(self, camera_name: str) -> bool:
+    async def start_liveview(self, camera_name: str, *, motion_triggered: bool = False) -> bool:
         """
         Start a real, on-demand Blink liveview session for camera_name and
         relay it through to the same mediamtx output path the motion-clip
@@ -84,8 +93,12 @@ class Application:
             log.warning(f"{camera_name}: liveview requested for unknown/disabled camera")
             return False
 
+        max_duration = MOTION_LIVEVIEW_MAX_DURATION if motion_triggered else LIVEVIEW_MAX_DURATION
         if camera_name in self.live_sessions:
             log.debug(f"{camera_name}: liveview already active")
+            self.liveview_requests[camera_name]["requested_at"] = datetime.now()
+            if motion_triggered:
+                self.liveview_requests[camera_name]["max_duration"] = max_duration
             return True
 
         request = self.liveview_requests.setdefault(camera_name, {
@@ -93,6 +106,7 @@ class Application:
             "retry_count": 0,
             "next_retry_at": None,
             "last_error": None,
+            "max_duration": max_duration,
         })
 
         try:
@@ -166,7 +180,7 @@ class Application:
         now = datetime.now()
         expired = [
             name for name, request in self.liveview_requests.items()
-            if now > request["requested_at"] + LIVEVIEW_MAX_DURATION
+            if now > request["requested_at"] + request.get("max_duration", LIVEVIEW_MAX_DURATION)
         ]
         for camera_name in expired:
             log.warning(f"{camera_name}: liveview session exceeded max duration, force-stopping")
@@ -203,6 +217,19 @@ class Application:
                 "last_error": request["last_error"],
                 "next_retry_at": request["next_retry_at"].isoformat() if request["next_retry_at"] else None,
             }
+        # A motion-liveview-only camera (e.g. AldrichFront) has no cloud
+        # clip to loop between motion events -- stop_live_relay() leaves
+        # current_still_video None for exactly this case (see that
+        # method's own comment). Reporting "clip_loop" here would be a
+        # real lie: it implies footage is actively looping/available when
+        # the stream is genuinely idle with nothing to show. Only applies
+        # to cameras opted into motion_liveview_enabled; a normal
+        # clip-loop camera (e.g. driveway) is unaffected.
+        if (
+            camera_name in self.motion_liveview_cameras
+            and self.stream_servers[camera_name].current_still_video is None
+        ):
+            return {"camera": camera_name, "mode": "idle_awaiting_motion", "live": False}
         return {"camera": camera_name, "mode": "clip_loop", "live": False}
 
     async def _reap_dead_liveview_sessions(self) -> None:
@@ -310,7 +337,14 @@ class Application:
                     ss_new.failure_count = ss.failure_count + 1
                     ss_new.datetime_started = datetime.now()
 
-            await asyncio.sleep(CONFIG['blink']['poll_interval'])
+            configured_poll_interval = CONFIG['blink']['poll_interval']
+            poll_interval = max(configured_poll_interval, MIN_BLINK_POLL_INTERVAL_SECONDS)
+            if configured_poll_interval < MIN_BLINK_POLL_INTERVAL_SECONDS:
+                log.warning(
+                    f"Blink poll_interval {configured_poll_interval}s is below the safe floor; "
+                    f"using {MIN_BLINK_POLL_INTERVAL_SECONDS}s"
+                )
+            await asyncio.sleep(poll_interval)
 
     async def close(self) -> None:
         self.running = False

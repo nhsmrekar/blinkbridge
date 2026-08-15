@@ -39,6 +39,8 @@ class CameraManager:
     def __init__(self):
         self.session = ClientSession()
         self.camera_last_record = defaultdict(lambda: None)
+        self.camera_motion_active = defaultdict(bool)
+        self.camera_last_motion_token = defaultdict(lambda: None)
         self.metadata = None
 
     async def _login(self) -> None:
@@ -131,41 +133,66 @@ class CameraManager:
         with open(file_name, 'wb') as f:
             f.write(await response.read())
     
-    async def check_for_motion(self, camera_name: str) -> Union[Path, None]:
-        '''
-        Check if a camera has been motion detected
-        '''
+    async def check_for_motion(self, camera_name: str) -> Tuple[bool, Union[Path, None]]:
+        """
+        Check whether Blink reports a new motion event and, when available,
+        download its cloud clip.
+
+        The motion boolean is intentionally independent of clip availability.
+        Accounts without cloud recording can still expose motion_detected via
+        Blink's camera status even though there is no media URL to download.
+        """
         await self.blink.refresh()
         camera = self.blink.cameras[camera_name]
+        attributes = camera.attributes
+        motion_detected = bool(attributes.get("motion_detected"))
+        motion_token = attributes.get("last_record") or attributes.get("video")
+        previous_active = self.camera_motion_active[camera_name]
+        previous_token = self.camera_last_motion_token[camera_name]
 
-        if not camera.attributes['motion_detected'] or self.camera_last_record[camera_name] == camera.attributes['last_record']:
-            return None
+        is_new_motion = motion_detected and (
+            not previous_active
+            or (motion_token is not None and motion_token != previous_token)
+        )
 
-        log.debug(f"{camera_name}: motion detected: {camera.attributes}")
+        self.camera_motion_active[camera_name] = motion_detected
+        if motion_detected and motion_token is not None:
+            self.camera_last_motion_token[camera_name] = motion_token
 
-        camera_name_sanitized = camera_name.lower().replace(' ', '_')
+        if not is_new_motion:
+            return False, None
+
+        log.info(f"{camera_name}: new Blink motion event detected")
+
+        camera_name_sanitized = camera_name.lower().replace(" ", "_")
         file_name = PATH_VIDEOS / f"{camera_name_sanitized}_latest.mp4"
 
-        # HACK: detect snapshot events and see if there is a recent clip in them
-        if '/snapshot/' in camera.attributes['video']:
-            if url := find_most_recent_clip_url(camera.attributes['recent_clips'], camera.attributes['last_record']):
+        video_url = attributes.get("video") or ""
+        if "/snapshot/" in video_url:
+            last_record = attributes.get("last_record")
+            if last_record and (url := find_most_recent_clip_url(
+                attributes.get("recent_clips", []),
+                last_record,
+            )):
                 log.debug(f"{camera_name}: found recent clip in snapshot, saving to {file_name}")
                 await self._save_clip(camera_name, url, file_name)
-                self.camera_last_record[camera_name] = camera.attributes['last_record']
-            
-                return file_name
+                self.camera_last_record[camera_name] = attributes.get("last_record")
+                return True, file_name
 
-            log.debug(f"{camera_name}: no recent clip in snapshot, skipping")
-            self.camera_last_record[camera_name] = camera.attributes['last_record']
+            log.info(f"{camera_name}: motion event has no downloadable cloud clip")
+            self.camera_last_record[camera_name] = attributes.get("last_record")
+            return True, None
 
-            return None
-        
+        if not video_url:
+            log.info(f"{camera_name}: motion event has no cloud media URL")
+            self.camera_last_record[camera_name] = attributes.get("last_record")
+            return True, None
+
         log.debug(f"{camera_name}: saving video to {file_name}")
         await camera.video_to_file(file_name)
-        self.camera_last_record[camera_name] = camera.attributes['last_record']
+        self.camera_last_record[camera_name] = attributes.get("last_record")
+        return True, file_name
 
-        return file_name
-        
     def get_cameras(self) -> iter:
         return self.blink.cameras.keys()
     
